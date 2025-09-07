@@ -1,0 +1,133 @@
+{
+  "Google": {
+    "id": "google",
+    "name": "Google",
+    "domain": "Technology, Internet Services, Cloud Computing",
+    "products": [
+      "Google Search",
+      "Gmail",
+      "Google Cloud Platform",
+      "Android",
+      "YouTube"
+    ],
+    "technologies": [
+      "TensorFlow",
+      "Kubernetes",
+      "Go Programming Language",
+      "Protocol Buffers",
+      "MapReduce"
+    ],
+    "interview_focus": [
+      "Data Structures",
+      "Algorithms",
+      "System Design",
+      "Problem Solving",
+      "Distributed Computing"
+    ],
+    "description": "A global technology company specializing in internet services, software, cloud computing, and artificial intelligence",
+    "logo_url": "https://www.google.com/images/branding/googlelogo/1x/google_logo_color_272x92dp.png",
+    "engineering_challenges": {
+      "scalability": [
+        "Global infrastructure design",
+        "Handling billions of search queries",
+        "Real-time data processing"
+      ],
+      "reliability": [
+        "Fault-tolerant systems",
+        "Redundancy and failover mechanisms"
+      ],
+      "performance": [
+        "Low-latency search results",
+        "Efficient data indexing",
+        "Machine learning model optimization"
+      ]
+    },
+    "scale_metrics": {
+      "users": "2B+ monthly active",
+      "requests_per_day": "3.5B+ search queries"
+    },
+    "tech_stack_layers": {
+      "frontend": [
+        "Angular",
+        "React",
+        "TypeScript"
+      ],
+      "backend": [
+        "Java",
+        "Python",
+        "C++",
+        "Go"
+      ],
+      "data": [
+        "BigQuery",
+        "Spanner",
+        "Bigtable"
+      ],
+      "infrastructure": [
+        "Kubernetes",
+        "gRPC",
+        "Container technologies"
+      ]
+    },
+    "problem_domains": [
+      "Distributed Systems",
+      "Machine Learning",
+      "Artificial Intelligence",
+      "Cloud Computing",
+      "Mobile Technologies"
+    ],
+    "industry_buzzwords": [
+      "PageRank",
+      "Machine Learning",
+      "AI-first",
+      "Cloud Native",
+      "Microservices"
+    ],
+    "notable_systems": [
+      "MapReduce",
+      "BigTable",
+      "Google File System",
+      "Borg Container Orchestration"
+    ],
+    "data_processing_patterns": [
+      "Distributed Computing",
+      "Stream Processing",
+      "Batch Processing",
+      "Real-time Analytics"
+    ],
+    "optimization_priorities": [
+      "Latency Reduction",
+      "Computational Efficiency",
+      "Energy Consumption",
+      "Cost Optimization"
+    ],
+    "analogy_patterns": {
+      "Array": [
+        {
+          "context": "search",
+          "analogy": "Search result ranking algorithm"
+        },
+        {
+          "context": "caching",
+          "analogy": "Efficient result retrieval"
+        }
+      ],
+      "Graph": [
+        {
+          "context": "search",
+          "analogy": "PageRank link relationship mapping"
+        },
+        {
+          "context": "social",
+          "analogy": "Knowledge graph connections"
+        }
+      ],
+      "Tree": [
+        {
+          "context": "indexing",
+          "analogy": "Efficient information retrieval structure"
+        }
+      ]
+    }
+  }
+}

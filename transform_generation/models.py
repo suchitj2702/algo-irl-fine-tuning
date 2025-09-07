@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import Dict, List, Optional, Any
 
@@ -61,13 +61,44 @@ class Problem:
 
 @dataclass
 class Company:
-    """Represents a company profile"""
+    """Represents a company profile with extended context"""
+    # Core fields (backward compatible)
     id: str
     name: str
     domain: str
     products: List[str]
     technologies: List[str]
     interview_focus: List[str]
+    
+    # Optional fields for enhanced context
+    description: Optional[str] = None
+    logo_url: Optional[str] = None
+    engineering_challenges: Optional[Dict[str, List[str]]] = None
+    scale_metrics: Optional[Dict[str, str]] = None
+    tech_stack_layers: Optional[Dict[str, List[str]]] = None
+    problem_domains: Optional[List[str]] = None
+    industry_buzzwords: Optional[List[str]] = None
+    notable_systems: Optional[List[str]] = None
+    data_processing_patterns: Optional[List[str]] = None
+    optimization_priorities: Optional[List[str]] = None
+    analogy_patterns: Optional[Dict[str, List[Dict[str, str]]]] = None
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Company':
+        """Create Company from dictionary, handling both old and new formats"""
+        # Handle the old 'interviewFocus' key name
+        if 'interviewFocus' in data and 'interview_focus' not in data:
+            data['interview_focus'] = data.pop('interviewFocus')
+        
+        # Handle 'logoUrl' -> 'logo_url'
+        if 'logoUrl' in data and 'logo_url' not in data:
+            data['logo_url'] = data.pop('logoUrl')
+            
+        # Extract only the fields that exist in the dataclass
+        valid_fields = {f.name for f in fields(cls)}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        
+        return cls(**filtered_data)
 
 
 @dataclass
@@ -118,3 +149,12 @@ class StructuredScenario:
     examples: List[Dict[str, Any]]
     requirements: List[str]
     function_mapping: Dict[str, str]
+
+
+class RoleFamily(Enum):
+    """Software engineering role families for targeted transformations"""
+    BACKEND_SYSTEMS = "backend"
+    ML_DATA = "ml"
+    FRONTEND_FULLSTACK = "frontend" 
+    INFRASTRUCTURE_PLATFORM = "infrastructure"
+    SECURITY_RELIABILITY = "security"

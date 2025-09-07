@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Algo-IRL Problem Transformation Script
-Transforms coding problems into company-specific interview scenarios
+Transforms coding problems into company and role-specific interview scenarios
 
 Requirements:
     pip install openai               # For OpenAI GPT models
     pip install anthropic            # For Anthropic Claude models  
     pip install google-generativeai  # For Google Gemini models
     pip install python-dotenv        # For loading environment variables
+    pip install firebase-admin       # Optional: For Firestore integration
 
 Environment Variables:
     OPENAI_API_KEY      - Your OpenAI API key (for --provider gpt)
@@ -15,12 +16,36 @@ Environment Variables:
     GOOGLE_API_KEY      - Your Google API key (for --provider gemini)
 
 Usage:
-    python -m transform_generation.problem_transformer <company_name> <problem_id> [--provider <provider_name>]
+    python -m transform_generation.problem_transformer <company_name> <problem_id> [options]
+
+Options:
+    --provider <name>    LLM provider: claude (default), gpt, or gemini
+    --role <type>        Engineering role: backend, ml, frontend, infrastructure, or security
+    --use-firestore      Use Firestore for company data instead of local cache
 
 Examples:
-    python -m transform_generation.problem_transformer "Google" "two-sum"
-    python -m transform_generation.problem_transformer "Google" "two-sum" --provider gpt
-    python -m transform_generation.problem_transformer "Google" "two-sum" --provider gemini
+    # Basic transformation (uses local cache for company data)
+    python -m transform_generation.problem_transformer Google two-sum
+    
+    # With specific provider
+    python -m transform_generation.problem_transformer Google two-sum --provider gpt
+    
+    # With role specification (creates role-specific scenario)
+    python -m transform_generation.problem_transformer Google two-sum --role backend
+    python -m transform_generation.problem_transformer Meta graph-traversal --role ml
+    python -m transform_generation.problem_transformer Amazon two-sum --role infrastructure
+    
+    # Combined: specific provider and role
+    python -m transform_generation.problem_transformer Stripe payment-processing --provider gemini --role security
+    
+    # Use Firestore instead of local cache (requires Firebase setup)
+    python -m transform_generation.problem_transformer Google two-sum --use-firestore
+
+Notes:
+    - Company data is cached locally in company_data_cache/ directory
+    - First run for a company will generate and cache its data
+    - Role options create specialized scenarios for different engineering positions
+    - Transformations are saved in transformations/<provider>/ directory
 
 """
 
@@ -32,6 +57,7 @@ import time
 import argparse
 from typing import Dict, List, Optional, Any
 from dataclasses import asdict, fields
+from pathlib import Path
 from .models import (
     LLMTaskConfig,
     ProblemDifficulty,
@@ -42,6 +68,7 @@ from .models import (
     ExtractedCompanyInfo,
     TransformationContext,
     StructuredScenario,
+    RoleFamily,
 )
 from .providers import get_provider, TaskType, list_available_providers
 import logging
@@ -75,6 +102,163 @@ logger = logging.getLogger(__name__)
 
 
 
+class CompanyCache:
+    """Simple local cache for company data"""
+    
+    def __init__(self, cache_dir: str = "company_data_cache", provider_name: str = "claude"):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+        self.cache_file = self.cache_dir / "companies.json"
+        self.companies: Dict[str, Company] = {}
+        self.provider_name = provider_name
+        self._load_cache()
+    
+    def _load_cache(self):
+        """Load cached companies from file"""
+        if self.cache_file.exists():
+            try:
+                with open(self.cache_file, 'r') as f:
+                    data = json.load(f)
+                    for name, company_data in data.items():
+                        self.companies[name.lower()] = Company.from_dict(company_data)
+                logger.info(f"Loaded {len(self.companies)} companies from cache")
+            except Exception as e:
+                logger.warning(f"Could not load company cache: {e}")
+                self.companies = {}
+    
+    def _save_cache(self):
+        """Save companies to cache file"""
+        try:
+            data = {}
+            for name, company in self.companies.items():
+                data[company.name] = asdict(company)
+            with open(self.cache_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save company cache: {e}")
+    
+    def get_company(self, name: str) -> Optional[Company]:
+        """Get company from cache or generate if not exists"""
+        normalized_name = name.lower()
+        
+        if normalized_name in self.companies:
+            return self.companies[normalized_name]
+        
+        # Generate new company data using dedicated provider for company generation
+        company = self._generate_company_data(name)
+        if company:
+            self.companies[normalized_name] = company
+            self._save_cache()
+        return company
+    
+    def _generate_company_data(self, name: str) -> Optional[Company]:
+        """Generate comprehensive company data using LLM with COMPANY_DATA_GENERATION task type"""
+        try:
+            # Create a dedicated provider for company data generation
+            # This uses the optimized model configuration for this specific task:
+            # - Claude: claude-3-5-haiku-20241022 (faster, cheaper model)
+            # - GPT: gpt-3.5-turbo (cost-effective for structured data)
+            # - Gemini: gemini-1.5-flash-latest (fast generation)
+            provider = get_provider(
+                provider_name=self.provider_name,
+                task_type=TaskType.COMPANY_DATA_GENERATION
+            )
+            
+            # Log the provider configuration being used
+            config_summary = provider.get_config_summary()
+            logger.info(f"Generating company data for '{name}' using {config_summary['provider']} ({config_summary['model']})")
+            
+            prompt = f'''
+I need detailed information about the company "{name}" in JSON format.
+
+REQUIRED FIELDS (for backward compatibility):
+Please provide the following information:
+1. A concise description of what the company does
+2. The company's primary domain/industry
+3. List of main products or services (at least 3-5)
+4. List of key technologies used at the company (at least 3-5)
+5. List of typical interview focus areas for engineers at this company (at least 3-5)
+6. A URL to the company's logo (if well-known)
+
+ENHANCED FIELDS (for richer context):
+7. Engineering challenges organized by category
+8. Scale metrics (e.g., number of users, requests per day)
+9. Tech stack organized by layer (frontend, backend, data, infrastructure)
+10. Problem domains the company focuses on
+11. Industry-specific buzzwords and terminology
+12. Notable internal systems or technologies
+13. Data processing patterns used
+14. Optimization priorities
+15. Company-specific analogy patterns for different data structures
+
+Format your response as valid JSON ONLY with these exact fields:
+{{
+  "description": "string description here",
+  "domain": "string domain here",
+  "products": ["product1", "product2", "product3"],
+  "technologies": ["tech1", "tech2", "tech3"],
+  "interview_focus": ["focus1", "focus2", "focus3"],
+  "logo_url": "https://example.com/logo.png or null if unknown",
+  
+  "engineering_challenges": {{
+    "scalability": ["challenge1", "challenge2"],
+    "reliability": ["challenge3"],
+    "performance": ["challenge4"]
+  }},
+  "scale_metrics": {{
+    "users": "2B+ monthly active",
+    "requests_per_day": "100B+"
+  }},
+  "tech_stack_layers": {{
+    "frontend": ["React", "TypeScript"],
+    "backend": ["Java", "Python"]
+  }},
+  "problem_domains": ["distributed_systems", "machine_learning"],
+  "industry_buzzwords": ["term1", "term2"],
+  "notable_systems": ["System1", "System2"],
+  "data_processing_patterns": ["streaming", "batch"],
+  "optimization_priorities": ["latency", "throughput"],
+  
+  "analogy_patterns": {{
+    "Array": [
+      {{"context": "search", "analogy": "{name} search results ranking"}}
+    ],
+    "Graph": [
+      {{"context": "social", "analogy": "{name} user network"}}
+    ]
+  }}
+}}
+
+Do not include any text before or after the JSON.
+'''
+            
+            system_prompt = "You are an expert on technology companies and their engineering practices."
+            response = provider.generate_completion(system_prompt, prompt)
+            
+            # Parse JSON response
+            company_data = json.loads(response)
+            
+            # Add ID and name if not present
+            if 'id' not in company_data:
+                company_data['id'] = name.lower().replace(' ', '-')
+            if 'name' not in company_data:
+                company_data['name'] = name
+            
+            return Company.from_dict(company_data)
+            
+        except Exception as e:
+            logger.error(f"Failed to generate company data for '{name}': {e}")
+            # Return basic company data as fallback
+            return Company(
+                id=name.lower().replace(' ', '-'),
+                name=name,
+                domain='technology',
+                products=['Product 1', 'Product 2', 'Product 3'],
+                technologies=['Technology 1', 'Technology 2', 'Technology 3'],
+                interview_focus=['algorithms', 'system design', 'problem solving']
+            )
+
+
 class ProblemTransformer:
     """Main class for transforming problems into company-specific scenarios"""
 
@@ -90,6 +274,139 @@ class ProblemTransformer:
         'DynamicProgramming', 'Recursion', 'Backtracking', 'Greedy', 'TwoPointers',
         'SlidingWindow', 'Hashing', 'Memoization', 'UnionFind', 'TopologicalSort'
     ]
+
+    # Role-specific configurations
+    ROLE_CONFIGURATIONS = {
+        RoleFamily.BACKEND_SYSTEMS: {
+            'title': 'Backend & Distributed Systems Engineer',
+            'focus_areas': [
+                'API design and optimization',
+                'Distributed systems architecture',
+                'Database performance',
+                'Microservices orchestration',
+                'Message queue systems'
+            ],
+            'relevant_problems': [
+                'Rate limiting and throttling',
+                'Caching strategies',
+                'Data consistency',
+                'Service discovery',
+                'Load balancing'
+            ],
+            'key_metrics': ['requests per second', 'p99 latency', 'error rate', 'throughput'],
+            'typical_scenarios': [
+                'Design a distributed rate limiter',
+                'Optimize database query performance',
+                'Implement distributed caching',
+                'Build event-driven architectures'
+            ],
+            'algorithm_preferences': ['hashing', 'consistent hashing', 'bloom filters', 'consensus algorithms']
+        },
+        
+        RoleFamily.ML_DATA: {
+            'title': 'Machine Learning & Data Engineer',
+            'focus_areas': [
+                'Data pipeline design',
+                'Feature engineering',
+                'Model serving infrastructure',
+                'Stream processing',
+                'Data warehousing'
+            ],
+            'relevant_problems': [
+                'Real-time feature computation',
+                'Data deduplication',
+                'Streaming aggregations',
+                'Batch processing optimization',
+                'Data validation'
+            ],
+            'key_metrics': ['data freshness', 'pipeline latency', 'processing throughput', 'model accuracy'],
+            'typical_scenarios': [
+                'Build real-time ML feature pipelines',
+                'Design streaming ETL systems',
+                'Implement A/B testing frameworks',
+                'Optimize data sampling strategies'
+            ],
+            'algorithm_preferences': ['sampling algorithms', 'streaming algorithms', 'probabilistic data structures', 'MapReduce patterns']
+        },
+        
+        RoleFamily.FRONTEND_FULLSTACK: {
+            'title': 'Frontend & Full-Stack Engineer',
+            'focus_areas': [
+                'UI performance optimization',
+                'State management',
+                'Real-time collaboration',
+                'Progressive web apps',
+                'API integration'
+            ],
+            'relevant_problems': [
+                'Virtual scrolling',
+                'Debouncing and throttling',
+                'Offline synchronization',
+                'Optimistic UI updates',
+                'Client-side caching'
+            ],
+            'key_metrics': ['first contentful paint', 'time to interactive', 'bundle size', 'frame rate'],
+            'typical_scenarios': [
+                'Implement infinite scrolling',
+                'Build real-time collaborative editing',
+                'Design offline-first applications',
+                'Optimize rendering performance'
+            ],
+            'algorithm_preferences': ['tree diffing', 'memoization', 'virtual DOM algorithms', 'event delegation']
+        },
+        
+        RoleFamily.INFRASTRUCTURE_PLATFORM: {
+            'title': 'Infrastructure & Platform Engineer',
+            'focus_areas': [
+                'Container orchestration',
+                'CI/CD pipelines',
+                'Infrastructure as code',
+                'Service mesh',
+                'Observability'
+            ],
+            'relevant_problems': [
+                'Resource scheduling',
+                'Deployment strategies',
+                'Service discovery',
+                'Configuration management',
+                'Auto-scaling'
+            ],
+            'key_metrics': ['resource utilization', 'deployment frequency', 'MTTR', 'infrastructure cost'],
+            'typical_scenarios': [
+                'Design auto-scaling systems',
+                'Implement blue-green deployments',
+                'Build service mesh routing',
+                'Optimize container scheduling'
+            ],
+            'algorithm_preferences': ['bin packing', 'scheduling algorithms', 'graph algorithms', 'optimization algorithms']
+        },
+        
+        RoleFamily.SECURITY_RELIABILITY: {
+            'title': 'Security & Reliability Engineer',
+            'focus_areas': [
+                'Threat detection',
+                'Incident response',
+                'Chaos engineering',
+                'Access control',
+                'Compliance automation'
+            ],
+            'relevant_problems': [
+                'Anomaly detection',
+                'Rate limiting',
+                'Circuit breaking',
+                'Audit logging',
+                'Encryption key management'
+            ],
+            'key_metrics': ['MTBF', 'detection accuracy', 'false positive rate', 'recovery time'],
+            'typical_scenarios': [
+                'Detect fraudulent patterns',
+                'Implement circuit breakers',
+                'Design audit systems',
+                'Build DDoS protection'
+            ],
+            'algorithm_preferences': ['pattern matching', 'anomaly detection algorithms', 'cryptographic algorithms', 'statistical analysis']
+        }
+    }
 
     def __init__(self, provider_name: str = "claude", 
                  custom_config: Optional[Dict[str, Any]] = None):
@@ -307,86 +624,117 @@ class ProblemTransformer:
         return score
 
     def generate_suggested_analogy_points(self, problem_info: ExtractedProblemInfo,
-                                           company_info: ExtractedCompanyInfo) -> List[str]:
-        """Generate suggested analogy points for connecting problem to company context, replicating TS logic."""
+                                           company_info: ExtractedCompanyInfo,
+                                           role_family: Optional[RoleFamily] = None) -> List[str]:
+        """Generate suggested analogy points using enriched company data and role context."""
         analogy_points = []
-
-        # 1. Dynamic, pattern-based analogies from TS implementation
-        data_structure_to_product_mappings = [
-            {
-                'data_structure': 'Array',
-                'product_patterns': [
-                    {'pattern': r'(search)', 'analogy': '{company} search results list'},
-                    {'pattern': r'(video|stream)', 'analogy': '{company} video recommendations'},
-                    {'pattern': r'(product|item|shop)', 'analogy': '{company} product catalog'}
-                ]
-            },
-            {
-                'data_structure': 'Graph',
-                'product_patterns': [
-                    {'pattern': r'(map|navigation)', 'analogy': '{company} maps connections between locations'},
-                    {'pattern': r'(social|network|connect)', 'analogy': '{company} user connections network'},
-                    {'pattern': r'(recommendation)', 'analogy': '{company} recommendation system'}
-                ]
-            },
-            {
-                'data_structure': 'Tree',
-                'product_patterns': [
-                    {'pattern': r'(file|document)', 'analogy': '{company} file/folder hierarchy'},
-                    {'pattern': r'(category|taxonomy)', 'analogy': '{company} product category organization'},
-                    {'pattern': r'(ui|interface)', 'analogy': '{company} UI component hierarchy'}
-                ]
-            },
-            {
-                'data_structure': 'HashMap',
-                'product_patterns': [
-                    {'pattern': r'(cache|memory)', 'analogy': '{company} caching system'},
-                    {'pattern': r'(user|profile)', 'analogy': '{company} user profile store'},
-                    {'pattern': r'(config|setting)', 'analogy': '{company} configuration management'}
-                ]
-            }
-        ]
-
-        for ds_info in data_structure_to_product_mappings:
-            if ds_info['data_structure'] in problem_info.data_structures:
-                for product in company_info.products:
-                    for p_pattern in ds_info['product_patterns']:
-                        if re.search(p_pattern['pattern'], product.lower()):
-                            analogy_points.append(p_pattern['analogy'].replace('{company}', company_info.name))
-
-        # 2. Expert-curated analogies for major companies from TS implementation
-        company_name_lower = company_info.name.lower()
-        if company_name_lower == 'google':
-            if 'Tree' in problem_info.data_structures:
-                analogy_points.append("Google's PageRank algorithm for organizing search results")
-            if 'Graph' in problem_info.data_structures:
-                analogy_points.append("Google Maps route finding algorithm")
-        elif company_name_lower == 'amazon':
-            if 'optimize' in problem_info.keywords:
-                analogy_points.append("Amazon's warehouse optimization algorithms")
-            if 'HashMap' in problem_info.data_structures:
-                analogy_points.append("Amazon's product recommendation system")
-        elif company_name_lower == 'microsoft':
-            if 'Tree' in problem_info.data_structures:
-                analogy_points.append("Microsoft's file system directory structure")
-            if 'efficient' in problem_info.keywords:
-                analogy_points.append("Microsoft's Azure resource allocation system")
-
-        # 3. Graceful fallback from TS implementation
+        
+        # Use company's embedded analogy patterns if available
+        if hasattr(company_info, 'analogy_patterns') and company_info.analogy_patterns:
+            for ds in problem_info.data_structures:
+                if ds in company_info.analogy_patterns:
+                    for pattern in company_info.analogy_patterns[ds]:
+                        analogy = pattern.get('analogy', '') if isinstance(pattern, dict) else str(pattern)
+                        analogy_points.append(analogy)
+        
+        # Use company's engineering challenges if available
+        if hasattr(company_info, 'engineering_challenges') and company_info.engineering_challenges:
+            for category, challenges in company_info.engineering_challenges.items():
+                for challenge in challenges:
+                    # Check if challenge matches problem characteristics
+                    challenge_lower = challenge.lower()
+                    for algo in problem_info.core_algorithms:
+                        if algo.lower() in challenge_lower:
+                            analogy_points.append(f"{company_info.name}'s {challenge}")
+                            break
+                    for ds in problem_info.data_structures:
+                        if ds.lower() in challenge_lower:
+                            analogy_points.append(f"{company_info.name}'s {challenge}")
+                            break
+        
+        # Add role-specific analogies if role is specified
+        if role_family and role_family in self.ROLE_CONFIGURATIONS:
+            role_config = self.ROLE_CONFIGURATIONS[role_family]
+            for scenario in role_config['typical_scenarios']:
+                # Check if scenario matches problem characteristics
+                scenario_lower = scenario.lower()
+                for algo in problem_info.core_algorithms:
+                    if algo.lower() in scenario_lower:
+                        analogy_points.append(f"{company_info.name}'s {scenario.lower()}")
+                        break
+                for ds in problem_info.data_structures:
+                    if ds.lower() in scenario_lower:
+                        analogy_points.append(f"{company_info.name}'s {scenario.lower()}")
+                        break
+        
+        # Use notable systems if available
+        if hasattr(company_info, 'notable_systems') and company_info.notable_systems:
+            for system in company_info.notable_systems[:2]:  # Limit to first 2
+                analogy_points.append(f"{company_info.name}'s {system}")
+        
+        # Fallback to basic pattern matching if no enriched data
+        if not analogy_points:
+            # Use the original basic pattern matching
+            data_structure_to_product_mappings = [
+                {
+                    'data_structure': 'Array',
+                    'product_patterns': [
+                        {'pattern': r'(search)', 'analogy': '{company} search results list'},
+                        {'pattern': r'(video|stream)', 'analogy': '{company} video recommendations'},
+                        {'pattern': r'(product|item|shop)', 'analogy': '{company} product catalog'}
+                    ]
+                },
+                {
+                    'data_structure': 'Graph',
+                    'product_patterns': [
+                        {'pattern': r'(map|navigation)', 'analogy': '{company} maps connections between locations'},
+                        {'pattern': r'(social|network|connect)', 'analogy': '{company} user connections network'},
+                        {'pattern': r'(recommendation)', 'analogy': '{company} recommendation system'}
+                    ]
+                },
+                {
+                    'data_structure': 'Tree',
+                    'product_patterns': [
+                        {'pattern': r'(file|document)', 'analogy': '{company} file/folder hierarchy'},
+                        {'pattern': r'(category|taxonomy)', 'analogy': '{company} product category organization'},
+                        {'pattern': r'(ui|interface)', 'analogy': '{company} UI component hierarchy'}
+                    ]
+                },
+                {
+                    'data_structure': 'HashMap',
+                    'product_patterns': [
+                        {'pattern': r'(cache|memory)', 'analogy': '{company} caching system'},
+                        {'pattern': r'(user|profile)', 'analogy': '{company} user profile store'},
+                        {'pattern': r'(config|setting)', 'analogy': '{company} configuration management'}
+                    ]
+                }
+            ]
+            
+            for ds_info in data_structure_to_product_mappings:
+                if ds_info['data_structure'] in problem_info.data_structures:
+                    for product in company_info.products:
+                        for p_pattern in ds_info['product_patterns']:
+                            if re.search(p_pattern['pattern'], product.lower()):
+                                analogy_points.append(p_pattern['analogy'].replace('{company}', company_info.name))
+        
+        # Final fallback
         if not analogy_points:
             analogy_points.append(
                 f"{company_info.name}'s engineering challenges in the {company_info.domain} domain"
             )
-
-        return list(set(analogy_points))
+        
+        return list(set(analogy_points))  # Remove duplicates
 
     def create_transformation_context(self, problem: Problem,
-                                       company: Company) -> TransformationContext:
-        """Create transformation context for a problem and company"""
+                                       company: Company,
+                                       role_family: Optional[RoleFamily] = None) -> TransformationContext:
+        """Create transformation context for a problem and company with optional role"""
         problem_info = self.extract_problem_info(problem)
         company_info = self.extract_company_info(company, problem_info.keywords)
         relevance_score = self.calculate_relevance_score(problem_info, company_info)
-        suggested_analogy_points = self.generate_suggested_analogy_points(problem_info, company_info)
+        suggested_analogy_points = self.generate_suggested_analogy_points(
+            problem_info, company_info, role_family
+        )
 
         return TransformationContext(
             problem=problem_info,
@@ -489,16 +837,50 @@ DON'T CREATE MAPPING IF THE MAPPING IS UNCHANGED FOR SOME VALUE
 """
         return prompt
 
+    def generate_optimized_prompt_with_role(self, context: TransformationContext, 
+                                           role_family: Optional[RoleFamily] = None) -> str:
+        """Generate prompt with role-specific context"""
+        base_prompt = self.generate_optimized_prompt(context)
+        
+        if role_family and role_family in self.ROLE_CONFIGURATIONS:
+            role_config = self.ROLE_CONFIGURATIONS[role_family]
+            
+            # Create role-specific context section
+            role_section = f"""
+ROLE-SPECIFIC CONTEXT:
+* Position: {role_config['title']}
+* Focus Areas: {', '.join(role_config['focus_areas'])}
+* Relevant Problems: {', '.join(role_config['relevant_problems'][:3])}
+* Key Metrics: {', '.join(role_config['key_metrics'])}
+* Algorithm Preferences: {', '.join(role_config['algorithm_preferences'])}
+
+ROLE-SPECIFIC REQUIREMENTS:
+* Frame the problem in the context of a {role_config['title']} at {context.company.name}
+* Use metrics and terminology specific to this role
+* Consider typical scenarios this role would encounter
+* Emphasize the scale and constraints relevant to this position
+* Incorporate challenges from {', '.join(role_config['focus_areas'][:2])}
+"""
+            
+            # Insert role section before "YOUR TASK:"
+            base_prompt = base_prompt.replace(
+                "YOUR TASK:",
+                role_section + "\nYOUR TASK:"
+            )
+        
+        return base_prompt
+
     
 
-    def transform_problem(self, problem: Problem, company: Company) -> Dict[str, Any]:
-        """Main function to transform a problem into a company-specific scenario"""
+    def transform_problem(self, problem: Problem, company: Company, 
+                          role_family: Optional[RoleFamily] = None) -> Dict[str, Any]:
+        """Main function to transform a problem into a company-specific scenario with optional role"""
 
-        # Create transformation context
-        context = self.create_transformation_context(problem, company)
+        # Create transformation context with role
+        context = self.create_transformation_context(problem, company, role_family)
 
-        # Generate optimized prompt
-        prompt = self.generate_optimized_prompt(context)
+        # Generate optimized prompt with role context
+        prompt = self.generate_optimized_prompt_with_role(context, role_family)
 
         # Log the task configuration (matching algo-irl logging)
         config_summary = self.llm_provider.get_config_summary()
@@ -738,33 +1120,103 @@ def fetch_problem_by_id(problem_id: str) -> Optional[Problem]:
 
 
 def main():
-    """Main function to demonstrate the transformer with algo-irl configuration"""
+    """Main function with local caching and role support"""
 
-    parser = argparse.ArgumentParser(description="Transform a coding problem into a company-specific scenario.")
-    parser.add_argument("company_name", type=str, help="The name of the company to use for the transformation.")
-    parser.add_argument("problem_id", type=str, help="The ID of the problem to transform.")
+    parser = argparse.ArgumentParser(
+        description="Transform a coding problem into a company and role-specific scenario."
+    )
+    parser.add_argument("company_name", type=str, help="The name of the company")
+    parser.add_argument("problem_id", type=str, help="The ID of the problem")
     parser.add_argument(
         "--provider",
         type=str,
         default="claude",
         choices=list_available_providers(),
-        help="The LLM provider to use for the transformation.",
+        help="The LLM provider to use",
+    )
+    parser.add_argument(
+        "--role",
+        type=str,
+        choices=['backend', 'ml', 'frontend', 'infrastructure', 'security'],
+        help="The engineering role type for the transformation"
+    )
+    parser.add_argument(
+        "--use-firestore",
+        action="store_true",
+        help="Use Firestore instead of local cache for company data"
     )
 
     args = parser.parse_args()
+    
+    # Map role string to RoleFamily enum
+    role_family = None
+    if args.role:
+        role_map = {
+            'backend': RoleFamily.BACKEND_SYSTEMS,
+            'ml': RoleFamily.ML_DATA,
+            'frontend': RoleFamily.FRONTEND_FULLSTACK,
+            'infrastructure': RoleFamily.INFRASTRUCTURE_PLATFORM,
+            'security': RoleFamily.SECURITY_RELIABILITY
+        }
+        role_family = role_map.get(args.role)
 
-    # Fetch company and problem data from Firestore
-    company = fetch_company_by_name(args.company_name)
-    problem = fetch_problem_by_id(args.problem_id)
+    # Initialize transformer with selected provider
+    try:
+        transformer = ProblemTransformer(provider_name=args.provider)
+    except Exception as e:
+        logger.error(f"Failed to initialize {args.provider} provider: {e}")
+        print(f"\nTroubleshooting for {args.provider} provider:")
+        if args.provider == "claude":
+            print("1. Install Anthropic: pip install anthropic")
+            print("2. Set API key: export ANTHROPIC_API_KEY='your-api-key'")
+        elif args.provider == "gpt":
+            print("1. Install OpenAI: pip install openai")
+            print("2. Set API key: export OPENAI_API_KEY='your-api-key'")
+        elif args.provider == "gemini":
+            print("1. Install Google AI: pip install google-generativeai")
+            print("2. Set API key: export GOOGLE_API_KEY='your-api-key'")
+        print(f"\nAvailable providers: {', '.join(list_available_providers())}")
+        return
+    
+    # Get company data (prefer local cache unless --use-firestore is specified)
+    company = None
+    if args.use_firestore and FIREBASE_AVAILABLE:
+        company = fetch_company_by_name(args.company_name)
+    else:
+        # Use local cache with the same provider
+        cache = CompanyCache(provider_name=args.provider)
+        company = cache.get_company(args.company_name)
+    
+    # Fetch problem data (still from Firestore if available, otherwise create mock)
+    problem = None
+    if FIREBASE_AVAILABLE:
+        problem = fetch_problem_by_id(args.problem_id)
+    else:
+        # Create a mock problem for testing without Firestore
+        logger.warning("Firestore not available, using mock problem data")
+        problem = Problem(
+            id=args.problem_id,
+            title="Two Sum",
+            difficulty=ProblemDifficulty.EASY,
+            description="Given an array of integers and a target sum, return indices of two numbers that add up to the target.",
+            constraints=["2 <= nums.length <= 10^4", "-10^9 <= nums[i] <= 10^9"],
+            categories=["Array", "Hash Table"],
+            test_cases=[],
+            time_complexity="O(n)",
+            space_complexity="O(n)"
+        )
 
     if not company or not problem:
-        logger.error("Failed to fetch required data from Firestore. Exiting.")
+        logger.error("Failed to fetch required data. Exiting.")
         return
 
     print("="*70)
     print("ALGO-IRL PROBLEM TRANSFORMER")
     print("="*70)
-    print(f"\nTransforming problem '{problem.title}' for company '{company.name}'...")
+    print(f"\nTransforming problem '{problem.title}' for company '{company.name}'")
+    if role_family:
+        role_config = transformer.ROLE_CONFIGURATIONS[role_family]
+        print(f"Role: {role_config['title']}")
 
     print("\n" + "="*70)
     print(f"Using '{args.provider}' provider for problem transformation")
@@ -819,7 +1271,7 @@ def main():
         
         # Always generate new transformation for comparison
         print(f"\nGenerating new transformation for '{problem.title}' and {company.name}...")
-        result = transformer.transform_problem(problem, company)
+        result = transformer.transform_problem(problem, company, role_family)
 
         # Print results
         print("\n" + "="*70)
@@ -861,7 +1313,9 @@ def main():
                 print(f"  {original} → {renamed}")
 
         # Save transformation result to provider-specific folder
-        saved_filepath = transformer.save_transformation_to_file(result, problem.id, company.name)
+        # Include role in filename if specified
+        filename_company = f"{company.name}_{role_family.value}" if role_family else company.name
+        saved_filepath = transformer.save_transformation_to_file(result, problem.id, filename_company)
         if saved_filepath:
             print(f"\n💾 Transformation saved to {saved_filepath}")
         else:
